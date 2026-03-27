@@ -225,10 +225,10 @@ main() {
   setup_ubuntu_sources
   install_packages
   setup_dns
+  lock_dns
   enable_ip_forward
   enable_bbr
   generate_wireguard
-  lock_dns
 
   log "Done"
   echo "Use this file on your system:"
