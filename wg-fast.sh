@@ -24,10 +24,6 @@ CLIENT_NAME="${1:-client1}"
 WG_IF="wg0"
 WG_DIR="/etc/wireguard"
 CLIENT_DIR="${WG_DIR}/clients"
-WG_SUBNET="10.66.66.0/24"
-SERVER_WG_IP="10.66.66.1/24"
-CLIENT_WG_IP="10.66.66.2/32"
-CLIENT_WG_IP_PLAIN="10.66.66.2"
 MTU_VALUE="1380"
 
 log() {
@@ -56,6 +52,25 @@ pick_random_port() {
     [[ "$p" != "22" ]] || continue
     if ! ss -H -lun | awk '{print $5}' | grep -qE "[:.]${p}$"; then
       echo "$p"
+      return
+    fi
+  done
+}
+
+pick_random_subnet() {
+  while :; do
+    OCTET2="$(shuf -i 16-31 -n 1)"
+    OCTET3="$(shuf -i 1-254 -n 1)"
+    CANDIDATE_SUBNET="10.${OCTET2}.${OCTET3}.0/24"
+    CANDIDATE_SERVER_IP="10.${OCTET2}.${OCTET3}.1/24"
+    CANDIDATE_CLIENT_IP="10.${OCTET2}.${OCTET3}.2/32"
+    CANDIDATE_CLIENT_IP_PLAIN="10.${OCTET2}.${OCTET3}.2"
+
+    if ! ip route | grep -q "10\.${OCTET2}\.${OCTET3}\.0/24"; then
+      WG_SUBNET="${CANDIDATE_SUBNET}"
+      SERVER_WG_IP="${CANDIDATE_SERVER_IP}"
+      CLIENT_WG_IP="${CANDIDATE_CLIENT_IP}"
+      CLIENT_WG_IP_PLAIN="${CANDIDATE_CLIENT_IP_PLAIN}"
       return
     fi
   done
@@ -138,6 +153,8 @@ generate_wireguard() {
   mkdir -p "${WG_DIR}" "${CLIENT_DIR}"
   chmod 700 "${WG_DIR}" "${CLIENT_DIR}"
   umask 077
+
+  pick_random_subnet
 
   SERVER_PRIVKEY="$(wg genkey)"
   SERVER_PUBKEY="$(printf '%s' "${SERVER_PRIVKEY}" | wg pubkey)"
