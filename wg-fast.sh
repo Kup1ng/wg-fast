@@ -62,24 +62,16 @@ pick_random_port() {
 }
 
 setup_dns() {
-  log "Setting /etc/resolv.conf to 1.1.1.1 and 8.8.8.8"
-
   chattr -i /etc/resolv.conf >/dev/null 2>&1 || true
   rm -f /etc/resolv.conf
-
   cat > /etc/resolv.conf <<'EOF'
 nameserver 1.1.1.1
 nameserver 8.8.8.8
-options timeout:2 attempts:2 rotate
 EOF
+}
 
-  chmod 644 /etc/resolv.conf
-
-  if need_cmd chattr; then
-    chattr +i /etc/resolv.conf >/dev/null 2>&1 || warn "Could not make /etc/resolv.conf immutable on this filesystem."
-  else
-    warn "chattr not found yet; resolv.conf written but not immutable yet."
-  fi
+lock_dns() {
+  chattr +i /etc/resolv.conf >/dev/null 2>&1 || true
 }
 
 setup_ubuntu_sources() {
@@ -116,8 +108,6 @@ install_packages() {
     curl \
     ca-certificates \
     openssl \
-    resolvconf \
-    ufw \
     e2fsprogs
 }
 
