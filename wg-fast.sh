@@ -228,6 +228,7 @@ main() {
   enable_ip_forward
   enable_bbr
   generate_wireguard
+  lock_dns
 
   log "Done"
   echo "Use this file on your system:"
