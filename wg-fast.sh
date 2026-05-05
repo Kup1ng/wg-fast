@@ -36,7 +36,6 @@ echo "[+] Detected Ubuntu ${VERSION_ID} (${UBUNTU_CODENAME_DETECTED})"
 export DEBIAN_FRONTEND=noninteractive
 
 CLIENT_NAME="${1:-client1}"
-WG_IF="wg0"
 WG_DIR="/etc/wireguard"
 CLIENT_DIR="${WG_DIR}/clients"
 MTU_VALUE="1380"
@@ -61,10 +60,46 @@ get_public_ip() {
   ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}'
 }
 
+# pick first free wgN slot (wg0, wg1, wg2, ...)
+pick_free_interface() {
+  local n=0
+  while :; do
+    local candidate="wg${n}"
+    if [[ ! -f "${WG_DIR}/${candidate}.conf" ]] \
+       && ! ip link show "${candidate}" >/dev/null 2>&1 \
+       && ! systemctl is-enabled --quiet "wg-quick@${candidate}" 2>/dev/null \
+       && ! systemctl is-active --quiet "wg-quick@${candidate}" 2>/dev/null; then
+      echo "${candidate}"
+      return
+    fi
+    n=$((n + 1))
+    if [[ "${n}" -gt 50 ]]; then
+      echo "Too many wireguard interfaces, aborting." >&2
+      exit 1
+    fi
+  done
+}
+
+# return list of UDP ports used by existing wireguard configs
+existing_wg_ports() {
+  local f port
+  for f in "${WG_DIR}"/wg*.conf; do
+    [[ -f "${f}" ]] || continue
+    port="$(awk -F'=' '/^[[:space:]]*ListenPort[[:space:]]*=/ {gsub(/ /,"",$2); print $2; exit}' "${f}" || true)"
+    [[ -n "${port}" ]] && echo "${port}"
+  done
+}
+
 pick_random_port() {
+  local used_ports
+  used_ports="$(existing_wg_ports || true)"
   while :; do
     p="$(shuf -i 20000-59999 -n 1)"
     [[ "$p" != "22" ]] || continue
+    # skip ports already used by other wg configs
+    if echo "${used_ports}" | grep -qx "${p}"; then
+      continue
+    fi
     if ! ss -H -lun | awk '{print $5}' | grep -qE "[:.]${p}$"; then
       echo "$p"
       return
@@ -72,7 +107,27 @@ pick_random_port() {
   done
 }
 
+# return list of subnets used by existing wireguard configs (e.g. 10.22.132.0/24)
+existing_wg_subnets() {
+  local f addr
+  for f in "${WG_DIR}"/wg*.conf; do
+    [[ -f "${f}" ]] || continue
+    # take first Address line (server side has like 10.x.y.1/24)
+    addr="$(awk -F'=' '/^[[:space:]]*Address[[:space:]]*=/ {gsub(/ /,"",$2); print $2; exit}' "${f}" || true)"
+    if [[ -n "${addr}" ]]; then
+      # turn 10.22.132.1/24 into 10.22.132.0/24
+      local ip cidr
+      ip="${addr%/*}"
+      cidr="${addr#*/}"
+      IFS=. read -r o1 o2 o3 _ <<< "${ip}"
+      echo "${o1}.${o2}.${o3}.0/${cidr}"
+    fi
+  done
+}
+
 pick_random_subnet() {
+  local existing
+  existing="$(existing_wg_subnets || true)"
   while :; do
     OCTET2="$(shuf -i 16-31 -n 1)"
     OCTET3="$(shuf -i 1-254 -n 1)"
@@ -80,6 +135,11 @@ pick_random_subnet() {
     CANDIDATE_SERVER_IP="10.${OCTET2}.${OCTET3}.1/24"
     CANDIDATE_CLIENT_IP="10.${OCTET2}.${OCTET3}.2/32"
     CANDIDATE_CLIENT_IP_PLAIN="10.${OCTET2}.${OCTET3}.2"
+
+    # don't reuse a subnet that another wg config already uses
+    if echo "${existing}" | grep -qx "${CANDIDATE_SUBNET}"; then
+      continue
+    fi
 
     if ! ip route | grep -q "10\.${OCTET2}\.${OCTET3}\.0/24"; then
       WG_SUBNET="${CANDIDATE_SUBNET}"
@@ -112,7 +172,6 @@ setup_ubuntu_sources() {
   [[ -f /etc/apt/sources.list.d/ubuntu.sources ]] && cp -f /etc/apt/sources.list.d/ubuntu.sources /etc/apt/backup-chatgpt-wg/ubuntu.sources.bak || true
 
   if [[ "${UBUNTU_CODENAME_DETECTED}" == "jammy" ]]; then
-    # Ubuntu 22.04 - one-line format in /etc/apt/sources.list
     cat > /etc/apt/sources.list <<EOF
 deb http://archive.ubuntu.com/ubuntu ${UBUNTU_CODENAME_DETECTED} main restricted universe multiverse
 deb http://archive.ubuntu.com/ubuntu ${UBUNTU_CODENAME_DETECTED}-updates main restricted universe multiverse
@@ -124,7 +183,6 @@ EOF
       mv /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.disabled-by-wg-script
     fi
   else
-    # Ubuntu 24.04 - deb822 format in /etc/apt/sources.list.d/ubuntu.sources
     : > /etc/apt/sources.list
 
     cat > /etc/apt/sources.list.d/ubuntu.sources <<EOF
@@ -189,6 +247,10 @@ generate_wireguard() {
   chmod 700 "${WG_DIR}" "${CLIENT_DIR}"
   umask 077
 
+  # pick a free wgN slot, so existing instances stay untouched
+  WG_IF="$(pick_free_interface)"
+  log "Using interface ${WG_IF} (existing wireguard instances are left alone)"
+
   pick_random_subnet
 
   SERVER_PRIVKEY="$(wg genkey)"
@@ -207,7 +269,8 @@ generate_wireguard() {
   fi
 
   SERVER_CONF="${WG_DIR}/${WG_IF}.conf"
-  CLIENT_CONF="${CLIENT_DIR}/${CLIENT_NAME}.conf"
+  # include interface name in client filename so multiple instances don't collide
+  CLIENT_CONF="${CLIENT_DIR}/${CLIENT_NAME}-${WG_IF}.conf"
 
   cat > "${SERVER_CONF}" <<EOF
 [Interface]
@@ -261,7 +324,12 @@ EOF
   echo "Server public IP: ${SERVER_PUBLIC_IP}"
   echo "Server public interface: ${PUBLIC_IFACE}"
   echo "UDP port: ${WG_PORT}"
+  echo "Tunnel subnet: ${WG_SUBNET}"
   echo "Client config file: ${CLIENT_CONF}"
+
+  log "Existing WireGuard instances on this server"
+  systemctl list-units --type=service --all 'wg-quick@*' --no-pager --no-legend \
+    | awk '{print "  - " $1 " (" $3 "/" $4 ")"}' || true
 
   log "Client config text"
   echo "----------------------------------------"
@@ -282,8 +350,8 @@ main() {
   generate_wireguard
 
   log "Done"
-  echo "Use this file on your system:"
-  echo "${CLIENT_DIR}/${CLIENT_NAME}.conf"
+  echo "Use this file on your client device:"
+  echo "${CLIENT_DIR}/${CLIENT_NAME}-${WG_IF}.conf"
 }
 
 main "$@"
