@@ -13,10 +13,25 @@ fi
 
 . /etc/os-release
 
-if [[ "${ID:-}" != "ubuntu" || "${VERSION_ID:-}" != "22.04" ]]; then
-  echo "This script is made for Ubuntu 22.04 only."
+if [[ "${ID:-}" != "ubuntu" ]]; then
+  echo "This script is made for Ubuntu only (22.04 or 24.04)."
   exit 1
 fi
+
+case "${VERSION_ID:-}" in
+  22.04)
+    UBUNTU_CODENAME_DETECTED="jammy"
+    ;;
+  24.04)
+    UBUNTU_CODENAME_DETECTED="noble"
+    ;;
+  *)
+    echo "Unsupported Ubuntu version: ${VERSION_ID:-unknown}. Only 22.04 and 24.04 are supported."
+    exit 1
+    ;;
+esac
+
+echo "[+] Detected Ubuntu ${VERSION_ID} (${UBUNTU_CODENAME_DETECTED})"
 
 export DEBIAN_FRONTEND=noninteractive
 
@@ -90,21 +105,41 @@ lock_dns() {
 }
 
 setup_ubuntu_sources() {
-  log "Setting Ubuntu APT sources to official archive"
+  log "Setting Ubuntu APT sources to official archive (${UBUNTU_CODENAME_DETECTED})"
 
   mkdir -p /etc/apt/backup-chatgpt-wg
   [[ -f /etc/apt/sources.list ]] && cp -f /etc/apt/sources.list /etc/apt/backup-chatgpt-wg/sources.list.bak || true
   [[ -f /etc/apt/sources.list.d/ubuntu.sources ]] && cp -f /etc/apt/sources.list.d/ubuntu.sources /etc/apt/backup-chatgpt-wg/ubuntu.sources.bak || true
 
-  cat > /etc/apt/sources.list <<'EOF'
-deb http://archive.ubuntu.com/ubuntu jammy main restricted universe multiverse
-deb http://archive.ubuntu.com/ubuntu jammy-updates main restricted universe multiverse
-deb http://archive.ubuntu.com/ubuntu jammy-backports main restricted universe multiverse
-deb http://security.ubuntu.com/ubuntu jammy-security main restricted universe multiverse
+  if [[ "${UBUNTU_CODENAME_DETECTED}" == "jammy" ]]; then
+    # Ubuntu 22.04 - one-line format in /etc/apt/sources.list
+    cat > /etc/apt/sources.list <<EOF
+deb http://archive.ubuntu.com/ubuntu ${UBUNTU_CODENAME_DETECTED} main restricted universe multiverse
+deb http://archive.ubuntu.com/ubuntu ${UBUNTU_CODENAME_DETECTED}-updates main restricted universe multiverse
+deb http://archive.ubuntu.com/ubuntu ${UBUNTU_CODENAME_DETECTED}-backports main restricted universe multiverse
+deb http://security.ubuntu.com/ubuntu ${UBUNTU_CODENAME_DETECTED}-security main restricted universe multiverse
 EOF
 
-  if [[ -f /etc/apt/sources.list.d/ubuntu.sources ]]; then
-    mv /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.disabled-by-wg-script
+    if [[ -f /etc/apt/sources.list.d/ubuntu.sources ]]; then
+      mv /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.disabled-by-wg-script
+    fi
+  else
+    # Ubuntu 24.04 - deb822 format in /etc/apt/sources.list.d/ubuntu.sources
+    : > /etc/apt/sources.list
+
+    cat > /etc/apt/sources.list.d/ubuntu.sources <<EOF
+Types: deb
+URIs: http://archive.ubuntu.com/ubuntu/
+Suites: ${UBUNTU_CODENAME_DETECTED} ${UBUNTU_CODENAME_DETECTED}-updates ${UBUNTU_CODENAME_DETECTED}-backports
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+Types: deb
+URIs: http://security.ubuntu.com/ubuntu/
+Suites: ${UBUNTU_CODENAME_DETECTED}-security
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+EOF
   fi
 }
 
