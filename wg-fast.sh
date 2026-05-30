@@ -40,6 +40,10 @@ WG_DIR="/etc/wireguard"
 CLIENT_DIR="${WG_DIR}/clients"
 MTU_VALUE="1380"
 
+# marker line written into every server config created by this script,
+# so delete/show menus can tell our instances apart from others
+MANAGED_MARKER="wg-fast-managed"
+
 log() {
   printf '\n[+] %s\n' "$1"
 }
@@ -273,6 +277,8 @@ generate_wireguard() {
   CLIENT_CONF="${CLIENT_DIR}/${CLIENT_NAME}-${WG_IF}.conf"
 
   cat > "${SERVER_CONF}" <<EOF
+# ${MANAGED_MARKER}
+# client-name = ${CLIENT_NAME}
 [Interface]
 Address = ${SERVER_WG_IP}
 ListenPort = ${WG_PORT}
@@ -340,7 +346,102 @@ EOF
   qrencode -t ANSIUTF8 < "${CLIENT_CONF}" || true
 }
 
-main() {
+# ---------------------------------------------------------------------------
+# Management helpers (used by delete / show menus)
+# ---------------------------------------------------------------------------
+
+# is a given interface (e.g. wg0) one that this script created?
+is_managed_interface() {
+  local iface="$1"
+  local conf="${WG_DIR}/${iface}.conf"
+  [[ -f "${conf}" ]] || return 1
+
+  # new instances carry the marker line
+  if grep -q "${MANAGED_MARKER}" "${conf}" 2>/dev/null; then
+    return 0
+  fi
+
+  # fallback for older instances: a matching client config exists
+  local cf
+  for cf in "${CLIENT_DIR}"/*-"${iface}".conf; do
+    [[ -e "${cf}" ]] && return 0
+  done
+
+  return 1
+}
+
+# print the names of all managed interfaces, one per line, sorted
+list_managed_interfaces() {
+  local f base iface
+  for f in "${WG_DIR}"/wg*.conf; do
+    [[ -f "${f}" ]] || continue
+    base="$(basename "${f}")"
+    iface="${base%.conf}"
+    if is_managed_interface "${iface}"; then
+      echo "${iface}"
+    fi
+  done | sort -V
+}
+
+# fully remove one wg instance: stop service, drop link, delete files
+remove_one_interface() {
+  local iface="$1"
+  log "Removing ${iface}"
+
+  # stop first so PostDown runs (it cleans the iptables rules) while conf still exists
+  systemctl stop "wg-quick@${iface}" >/dev/null 2>&1 || true
+  systemctl disable "wg-quick@${iface}" >/dev/null 2>&1 || true
+
+  # in case the link is still around
+  if ip link show "${iface}" >/dev/null 2>&1; then
+    ip link delete "${iface}" 2>/dev/null || true
+  fi
+
+  rm -f "${WG_DIR}/${iface}.conf"
+
+  # remove matching client configs
+  local cf
+  for cf in "${CLIENT_DIR}"/*-"${iface}".conf; do
+    [[ -e "${cf}" ]] || continue
+    rm -f "${cf}"
+    echo "  removed client config: ${cf}"
+  done
+
+  echo "  ${iface} removed."
+}
+
+# pretty one-line summary for an interface, used in menus
+iface_summary() {
+  local iface="$1"
+  local conf="${WG_DIR}/${iface}.conf"
+  local port subnet status name
+  port="$(awk -F'=' '/^[[:space:]]*ListenPort/ {gsub(/ /,"",$2); print $2; exit}' "${conf}" 2>/dev/null || true)"
+  subnet="$(awk -F'=' '/^[[:space:]]*Address/ {gsub(/ /,"",$2); print $2; exit}' "${conf}" 2>/dev/null || true)"
+  name="$(awk -F'=' '/^#[[:space:]]*client-name/ {gsub(/ /,"",$2); print $2; exit}' "${conf}" 2>/dev/null || true)"
+  if systemctl is-active --quiet "wg-quick@${iface}" 2>/dev/null; then
+    status="active"
+  else
+    status="inactive"
+  fi
+  printf '%s  (client: %s, port: %s, addr: %s, %s)' \
+    "${iface}" "${name:-?}" "${port:-?}" "${subnet:-?}" "${status}"
+}
+
+# ---------------------------------------------------------------------------
+# Actions
+# ---------------------------------------------------------------------------
+
+do_install() {
+  # let the user choose a client name (default comes from $1 or "client1")
+  local default_name="${CLIENT_NAME}"
+  local name_input
+  read -rp "Client name [${default_name}]: " name_input
+  CLIENT_NAME="${name_input:-${default_name}}"
+  # sanitize: no spaces or path separators in the filename
+  CLIENT_NAME="${CLIENT_NAME// /_}"
+  CLIENT_NAME="${CLIENT_NAME//\//_}"
+  [[ -z "${CLIENT_NAME}" ]] && CLIENT_NAME="${default_name}"
+
   setup_dns
   lock_dns
   setup_ubuntu_sources
@@ -351,7 +452,167 @@ main() {
 
   log "Done"
   echo "Use this file on your client device:"
-  echo "${CLIENT_DIR}/${CLIENT_NAME}-${WG_IF}.conf"
+  echo "${CLIENT_CONF}"
+}
+
+do_delete() {
+  log "Delete WireGuard instance(s)"
+
+  local ifaces=()
+  mapfile -t ifaces < <(list_managed_interfaces)
+
+  if [[ "${#ifaces[@]}" -eq 0 ]]; then
+    warn "No WireGuard instances created by this script were found."
+    return
+  fi
+
+  echo "Existing WireGuard instances:"
+  local i
+  for i in "${!ifaces[@]}"; do
+    printf "  %d) %s\n" "$((i + 1))" "$(iface_summary "${ifaces[$i]}")"
+  done
+  printf "  a) all of the above\n"
+  printf "  q) cancel\n"
+
+  local choice
+  read -rp "Select instance to delete [number / a / q]: " choice
+
+  local to_delete=()
+  case "${choice}" in
+    q|Q|"")
+      warn "Cancelled."
+      return
+      ;;
+    a|A|all|ALL)
+      to_delete=("${ifaces[@]}")
+      ;;
+    *)
+      if [[ "${choice}" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#ifaces[@]} )); then
+        to_delete=("${ifaces[$((choice - 1))]}")
+      else
+        warn "Invalid selection."
+        return
+      fi
+      ;;
+  esac
+
+  echo
+  echo "About to delete: ${to_delete[*]}"
+  local confirm
+  read -rp "Are you sure? This stops the tunnel(s) and removes their files [y/N]: " confirm
+  if [[ ! "${confirm}" =~ ^[Yy]$ ]]; then
+    warn "Cancelled."
+    return
+  fi
+
+  local iface
+  for iface in "${to_delete[@]}"; do
+    remove_one_interface "${iface}"
+  done
+
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  log "Deletion complete."
+}
+
+do_show() {
+  log "Show WireGuard client config"
+
+  local ifaces=()
+  mapfile -t ifaces < <(list_managed_interfaces)
+
+  if [[ "${#ifaces[@]}" -eq 0 ]]; then
+    warn "No WireGuard instances created by this script were found."
+    return
+  fi
+
+  echo "Existing WireGuard instances:"
+  local i
+  for i in "${!ifaces[@]}"; do
+    printf "  %d) %s\n" "$((i + 1))" "$(iface_summary "${ifaces[$i]}")"
+  done
+  printf "  q) cancel\n"
+
+  local choice
+  read -rp "Select instance to show [number / q]: " choice
+  if [[ "${choice}" =~ ^[Qq]$ || -z "${choice}" ]]; then
+    warn "Cancelled."
+    return
+  fi
+  if ! [[ "${choice}" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#ifaces[@]} )); then
+    warn "Invalid selection."
+    return
+  fi
+
+  local iface="${ifaces[$((choice - 1))]}"
+
+  # collect client config file(s) belonging to this interface
+  local clients=()
+  local cf
+  for cf in "${CLIENT_DIR}"/*-"${iface}".conf; do
+    [[ -e "${cf}" ]] && clients+=("${cf}")
+  done
+
+  if [[ "${#clients[@]}" -eq 0 ]]; then
+    warn "No client config file found for ${iface} in ${CLIENT_DIR}."
+    return
+  fi
+
+  local target
+  if [[ "${#clients[@]}" -eq 1 ]]; then
+    target="${clients[0]}"
+  else
+    echo "Multiple client configs for ${iface}:"
+    for i in "${!clients[@]}"; do
+      printf "  %d) %s\n" "$((i + 1))" "$(basename "${clients[$i]}")"
+    done
+    local c2
+    read -rp "Select client config [number]: " c2
+    if ! [[ "${c2}" =~ ^[0-9]+$ ]] || (( c2 < 1 || c2 > ${#clients[@]} )); then
+      warn "Invalid selection."
+      return
+    fi
+    target="${clients[$((c2 - 1))]}"
+  fi
+
+  log "Client config: ${target}"
+  echo "----------------------------------------"
+  cat "${target}"
+  echo "----------------------------------------"
+
+  if need_cmd qrencode; then
+    log "QR code"
+    qrencode -t ANSIUTF8 < "${target}" || true
+  else
+    warn "qrencode is not installed; cannot render the QR code."
+    echo "Install it with: apt-get install -y qrencode"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Menu / entry point
+# ---------------------------------------------------------------------------
+
+main_menu() {
+  echo
+  echo "================ wg-fast ================"
+  echo "  1) Install / create a new WireGuard"
+  echo "  2) Delete an existing WireGuard"
+  echo "  3) Show a WireGuard config (text + QR)"
+  echo "  q) Quit"
+  echo "========================================="
+  local action
+  read -rp "Choose an option [1/2/3/q]: " action
+  case "${action}" in
+    1) do_install ;;
+    2) do_delete ;;
+    3) do_show ;;
+    q|Q|"") log "Bye."; exit 0 ;;
+    *) warn "Invalid option."; exit 1 ;;
+  esac
+}
+
+main() {
+  main_menu
 }
 
 main "$@"
