@@ -38,7 +38,7 @@ export DEBIAN_FRONTEND=noninteractive
 CLIENT_NAME="${1:-client1}"
 WG_DIR="/etc/wireguard"
 CLIENT_DIR="${WG_DIR}/clients"
-MTU_VALUE="1280"
+MTU_VALUE="1356"
 
 # marker line written into every server config created by this script,
 # so delete/show menus can tell our instances apart from others
